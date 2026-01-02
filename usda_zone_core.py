@@ -12,25 +12,33 @@ def lon_to_0_360(lon: float) -> float:
 
 def add_cyclic_lon_column(da: xr.DataArray) -> xr.DataArray:
     """
-    Adds a wrapped column at lon=360 equal to lon=0 so linear interpolation
-    works across the 0/360 seam.
-    Assumes longitude is increasing and includes 0.0. No-op otherwise.
+    Add a wrap-around longitude column at (lon0 + 360) so xarray interpolation
+    across the dateline can work on a monotonic 0..360-ish axis.
+
+    Preconditions:
+      - da has dims ('latitude','longitude') (order doesn't matter)
+      - longitude is normalized to [0, 360) and sorted ascending
     """
-    if "longitude" not in da.coords:
+    if "longitude" not in da.dims:
+        raise ValueError("DataArray must have a 'longitude' dimension")
+
+    lon = da["longitude"].values
+    if lon.size < 2:
         return da
 
-    lon = da["longitude"].values.astype(np.float64)
-    if lon.size == 0:
-        return da
-    if abs(lon[0] - 0.0) > 1e-6:
-        return da
-    if lon[-1] >= 360.0 - 1e-6:
+    # If it's already cyclic (last looks like first+360), don't add again
+    if np.isfinite(lon[0]) and np.isfinite(lon[-1]) and np.isclose(lon[-1], lon[0] + 360.0):
         return da
 
-    wrap = da.isel(longitude=0).assign_coords(
-        longitude=np.array([360.0], dtype=np.float64)
-    )
-    return xr.concat([da, wrap], dim="longitude")
+    # Keep longitude dimension (size 1) so assign_coords matches dims
+    wrap = da.isel(longitude=slice(0, 1)).copy(deep=False)
+    wrap = wrap.assign_coords(longitude=(wrap["longitude"] + 360.0))
+
+    out = xr.concat([da, wrap], dim="longitude")
+    # Ensure strict increasing lon after concat
+    out = out.sortby("longitude")
+    return out
+
 
 
 def interp_temp_f_point(
