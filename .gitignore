@@ -1,0 +1,61 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# IDEs / editors
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# =========================
+# Logs / temp
+# =========================
+*.log
+*.tmp
+*.bak
+*.old
+
+# =========================
+# Archives
+# =========================
+*.zip
+*.gz
+*.tar
+*.tar.gz
+*.7z
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Outputs / generated files
+# =========================
+/data/
+/data/**
+*_output.*
+*_generated.*
+*_derived.*
+
+# =========================
+# OS-specific
+# =========================
+Thumbs.db
