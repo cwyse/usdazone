@@ -8,6 +8,10 @@ import argparse
 import numpy as np
 import xarray as xr
 
+# Use the shared, single-source-of-truth USDA zone logic
+# (create this module as discussed)
+from usda_zone_core import zone_num_from_temp_f, subzone_from_temp_f
+
 TILES_DIR = Path("data/processed/usda_zone_temperature_tiles")
 
 
@@ -96,9 +100,7 @@ def _compute_usda_zone_fields(
     temp_f: xr.DataArray,
 ) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
     """
-    USDA zone logic:
-      zone_num = floor((F + 60)/10) + 1, clipped to 1..13
-      subzone  = 'a' if F <= midpoint, else 'b'
+    Compute USDA zone rasters from temp_f using shared logic.
 
     Stored as numeric fields:
       - usda_zone_num: uint8 (1..13), 0 = missing
@@ -107,8 +109,9 @@ def _compute_usda_zone_fields(
     """
     valid = xr.apply_ufunc(np.isfinite, temp_f)
 
-    zone_num_f = xr.apply_ufunc(np.floor, (temp_f + 60.0) / 10.0) + 1.0
-    zone_num_f = zone_num_f.clip(1.0, 13.0)
+    # Shared logic
+    zone_num_f = zone_num_from_temp_f(temp_f)  # float array, 1..13
+    subzone01 = subzone_from_temp_f(temp_f, zone_num_f)  # 0=a, 1=b (boundary -> b)
 
     zone_num = zone_num_f.where(valid, other=0.0).astype(np.uint8)
     zone_num.name = "usda_zone_num"
@@ -122,12 +125,8 @@ def _compute_usda_zone_fields(
     )
     zone_num.encoding["_FillValue"] = np.uint8(0)
 
-    lower = -60.0 + (zone_num_f - 1.0) * 10.0
-    mid = lower + 5.0
-
     # IMPORTANT: do NOT use 0 as missing because 0 is the real value for 'a'
     sub_fill = np.uint8(255)
-    subzone01 = xr.where(temp_f <= mid, 0, 1).astype(np.uint8)
     subzone = subzone01.where(valid, other=sub_fill).astype(np.uint8)
     subzone.name = "usda_zone_subzone"
     subzone.attrs.update(
@@ -141,7 +140,11 @@ def _compute_usda_zone_fields(
     )
     subzone.encoding["_FillValue"] = sub_fill
 
-    zone_code = (zone_num.astype(np.uint16) * 2 + subzone01.astype(np.uint16)).where(valid, other=0).astype(np.uint16)
+    zone_code = (
+        (zone_num.astype(np.uint16) * 2 + subzone01.astype(np.uint16))
+        .where(valid, other=0)
+        .astype(np.uint16)
+    )
     zone_code.name = "usda_zone_code"
     zone_code.attrs.update(
         {
@@ -197,7 +200,7 @@ def main() -> None:
     if "usda_zone_temp_f" not in merged:
         merged["usda_zone_temp_f"] = temp_f
 
-    # Compute and store USDA zone fields
+    # Compute and store USDA zone fields (via shared logic)
     zone_num, subzone, zone_code = _compute_usda_zone_fields(merged["usda_zone_temp_f"])
     merged[zone_num.name] = zone_num
     merged[subzone.name] = subzone
@@ -214,7 +217,11 @@ def main() -> None:
             "institution": "Computed locally",
             "conventions": "CF-1.8",
             "period": f"{args.start_year}-{args.end_year}",
-            "usda_zone_definition": "zone_num=floor((F+60)/10)+1 clipped to 1..13; subzone a if F<=midpoint else b",
+            "usda_zone_definition": (
+                "zone_num=floor((F+60)/10)+1 clipped to 1..13; "
+                "subzone a if F<lower+5 else b (boundary -> b)"
+            ),
+            "usda_zone_logic_source": "usda_zone_core.py",
         }
     )
 
