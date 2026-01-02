@@ -61,16 +61,27 @@ LOCATIONS = [
 ]
 
 def main() -> None:
-    print(f"{'Location':<40} {'Temp (°F)':>10} {'Zone':>6}")
-    print("-" * 40)
+    # Make location column wide enough for the longest name
+    loc_w = max(len("Location"), max(len(name) for name, _, _ in LOCATIONS))
+    temp_w = len("Temp (°F)")
+    zone_w = len("Zone")
+
+    header = f"{'Location':<{loc_w}}  {'Temp (°F)':>{temp_w}}  {'Zone':>{zone_w}}"
+    print(header)
+    print("-" * len(header))
 
     with USDAZoneDataset(DATASET) as zds:
         for name, lat, lon in LOCATIONS:
             p = zds.point(lat, lon)
             if p.temp_f is None or p.zone_label == "—":
-                print(f"{name:<40} {'N/A':>10} {'—':>6}")
+                temp_s = "N/A"
+                zone_s = "—"
             else:
-                print(f"{name:<40} {p.temp_f:10.2f} {p.zone_label:>6}")
+                temp_s = f"{p.temp_f:.2f}"
+                zone_s = p.zone_label
+
+            print(f"{name:<{loc_w}}  {temp_s:>{temp_w}}  {zone_s:>{zone_w}}")
+
 
 if __name__ == "__main__":
     main()
