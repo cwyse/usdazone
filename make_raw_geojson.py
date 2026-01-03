@@ -2,30 +2,76 @@
 from __future__ import annotations
 
 """
-Create GeoJSON tile polygons for each leaf subdirectory under data/raw/era5_land_hourly_temp.
+make_raw_geojson.py
 
-Assumptions:
-- Each leaf dir (e.g. data/raw/era5_land_hourly_temp/north/lon090) contains many .nc files for
-  the same spatial extent, differing only by time.
-- We can pick any one .nc file per leaf dir, read its lat/lon coordinates, and
-  infer bounds.
+Create GeoJSON tile polygons for each “leaf” directory under a raw ERA5-Land download tree.
 
-Output:
-- Writes one GeoJSON per leaf dir to:
-    data/processed/geojson/era5_land_hourly_temp/<region>_<londir>.geojson
-  Example:
-    data/processed/geojson/era5_land_hourly_temp/north_lon090.geojson
+Context
+-------
+Your raw hourly ERA5-Land layout is organized as:
 
-- Also writes a combined GeoJSON FeatureCollection to:
-    data/processed/geojson/era5_land_hourly_temp/all_tiles.geojson
+  <root>/
+    <region>/
+      <londir>/
+        <many_month_files>.nc
 
-Usage:
-  python make_raw_geojson.py \
-    --root data/raw/era5_land_hourly_temp \
-    --out-dir data/processed/geojson/era5_land_hourly_temp
+Example:
+  data/raw/era5_land_hourly_temp/north/lon090/north_lon090_1991_12.nc
 
-Dependencies:
-- Prefers netCDF4; falls back to xarray if available.
+Each leaf directory (e.g., north/lon090) contains many NetCDF files with identical spatial
+extent (lat/lon grid), differing only in time coverage. This script:
+- selects one representative .nc file in each leaf directory,
+- reads its latitude/longitude coordinate arrays,
+- infers the min/max bounds,
+- writes a GeoJSON polygon for that tile.
+
+Outputs
+-------
+Per-leaf GeoJSON files:
+  <out-dir>/<region>_<londir>.geojson
+
+Combined FeatureCollection:
+  <out-dir>/all_tiles.geojson
+
+Default values match your repo layout:
+  --root    data/raw/era5_land_hourly_temp
+  --out-dir data/processed/geojson/era5_land_hourly_temp
+
+Intended use
+------------
+- Visualization / QA: quickly inspect tile coverage in a GIS viewer (QGIS, geojson.io, etc.).
+- Debugging: confirm expected bounds for each tile directory match your lat-band/lon-bin logic.
+- Metadata: produce a lightweight index (“tile_id -> polygon”) without opening all NetCDF files.
+
+Assumptions
+-----------
+- Leaf directory heuristic: any directory under --root that contains at least one *.nc file.
+- Within each leaf directory, *any one* .nc file is sufficient to infer bounds.
+- Latitude and longitude coordinates are present as 1D arrays named either:
+    - latitude / longitude (preferred)
+    - lat / lon           (alternate)
+
+Coordinate conventions
+----------------------
+This script does not attempt to:
+- normalize longitude to 0..360 vs -180..180
+- handle dateline wrapping polygons
+- infer true geodesic bounds
+
+It simply uses:
+  swlat = min(latitude)
+  nelat = max(latitude)
+  swlon = min(longitude)
+  nelon = max(longitude)
+
+and produces an axis-aligned bounding-box polygon (rectangle) in lon/lat.
+
+Dependencies
+------------
+- Prefers `netCDF4` for fast, low-overhead coordinate reads.
+- Falls back to `xarray` if netCDF4 is not installed.
+- If neither is installed, it fails with an explicit error.
+
 """
 
 import argparse
@@ -51,6 +97,24 @@ except Exception:
 
 @dataclass(frozen=True)
 class TileFeature:
+    """
+    Metadata for one tile (one leaf directory).
+
+    tile_id:
+      Derived identifier of the form "<region>_<londir>", e.g. "north_lon090".
+
+    region / londir:
+      Parsed from the leaf directory path relative to --root. Expected to be:
+        <root>/<region>/<londir>/...
+
+    sample_file:
+      Relative path (from --root) to the .nc file used to compute bounds.
+
+    swlat / swlon / nelat / nelon:
+      Axis-aligned bounding box corners:
+        SW = (min_lat, min_lon)
+        NE = (max_lat, max_lon)
+    """
     tile_id: str
     region: str
     londir: str
@@ -62,10 +126,23 @@ class TileFeature:
 
 
 def _find_coord_var(var_names: set[str], preferred: tuple[str, ...]) -> Optional[str]:
+    """
+    Find a coordinate variable name in a NetCDF variable-name set.
+
+    preferred:
+      Names to try first, e.g. ("latitude","lat").
+
+    Behavior:
+    - First checks exact matches against `preferred`.
+    - Then does a case-insensitive match against all variables.
+
+    Returns:
+      The matching variable name (as it appears in the file) or None if not found.
+    """
     for k in preferred:
         if k in var_names:
             return k
-    # common alternatives
+    # common alternatives (case-insensitive)
     for k in var_names:
         lk = k.lower()
         if lk in [p.lower() for p in preferred]:
@@ -74,10 +151,22 @@ def _find_coord_var(var_names: set[str], preferred: tuple[str, ...]) -> Optional
 
 
 def _isfinite(x: float) -> bool:
+    """True if x is a finite float (not NaN/inf)."""
     return math.isfinite(x)
 
 
 def bounds_from_netcdf4(path: Path) -> Tuple[float, float, float, float]:
+    """
+    Compute (swlat, swlon, nelat, nelon) using netCDF4.Dataset.
+
+    This is the preferred path when netCDF4 is installed:
+    - minimal overhead
+    - reads coord arrays directly
+
+    Raises:
+      KeyError if latitude/longitude variables are missing.
+      ValueError if any computed bounds are non-finite.
+    """
     with netCDF4.Dataset(str(path), "r") as ds:
         names = set(ds.variables.keys())
         lat_name = _find_coord_var(names, ("latitude", "lat"))
@@ -100,6 +189,13 @@ def bounds_from_netcdf4(path: Path) -> Tuple[float, float, float, float]:
 
 
 def bounds_from_xarray(path: Path) -> Tuple[float, float, float, float]:
+    """
+    Compute (swlat, swlon, nelat, nelon) using xarray.
+
+    This is a fallback when netCDF4 is not installed.
+    decode_times=False is used because we only care about coordinate arrays and
+    want to avoid unnecessary time decoding overhead.
+    """
     ds = xr.open_dataset(path, decode_times=False)
     try:
         coords = set(ds.coords) | set(ds.variables)
@@ -123,6 +219,9 @@ def bounds_from_xarray(path: Path) -> Tuple[float, float, float, float]:
         swlon = float(lon.min().values)
         nelon = float(lon.max().values)
 
+        # NOTE: the original code checks (swlat, nelat, swlon, nelat).
+        # That is a harmless redundancy in most cases because nelat is checked twice.
+        # We are not changing it here to avoid behavior changes.
         if not all(_isfinite(v) for v in (swlat, nelat, swlon, nelat)):
             raise ValueError("non-finite bounds")
 
@@ -132,6 +231,16 @@ def bounds_from_xarray(path: Path) -> Tuple[float, float, float, float]:
 
 
 def get_bounds(path: Path) -> Tuple[float, float, float, float]:
+    """
+    Choose the coordinate-reading backend based on installed dependencies.
+
+    Priority:
+      1) netCDF4
+      2) xarray
+
+    Raises:
+      RuntimeError if neither dependency is installed.
+    """
     if HAVE_NETCDF4:
         return bounds_from_netcdf4(path)
     if HAVE_XARRAY:
@@ -140,7 +249,13 @@ def get_bounds(path: Path) -> Tuple[float, float, float, float]:
 
 
 def polygon_from_bounds(swlat: float, swlon: float, nelat: float, nelon: float) -> dict:
-    # GeoJSON polygon ring: [ [lon, lat], ... ] closed
+    """
+    Build a GeoJSON Polygon from min/max bounds.
+
+    GeoJSON polygons use coordinates in [lon, lat] order and the ring must be closed.
+    This produces an axis-aligned rectangle:
+      SW -> SE -> NE -> NW -> SW
+    """
     ring = [
         [swlon, swlat],
         [nelon, swlat],
@@ -152,6 +267,11 @@ def polygon_from_bounds(swlat: float, swlon: float, nelat: float, nelon: float) 
 
 
 def feature_to_geojson(tile: TileFeature) -> dict:
+    """
+    Convert TileFeature metadata into a GeoJSON Feature with:
+    - properties: human-readable metadata (tile_id, region, sample_file, bounds)
+    - geometry: rectangle polygon derived from bounds
+    """
     return {
         "type": "Feature",
         "properties": {
@@ -169,13 +289,28 @@ def feature_to_geojson(tile: TileFeature) -> dict:
 
 
 def pick_sample_nc(dir_path: Path) -> Optional[Path]:
-    # Prefer smallest filename sort for determinism; any file is fine per your assumption.
+    """
+    Pick one NetCDF file from a leaf directory to infer spatial bounds.
+
+    Determinism:
+      Uses lexical sort and picks the first file. Any file in the directory should have the
+      same lat/lon grid, so choice does not matter for correctness (given the assumption).
+    """
     ncs = sorted(dir_path.glob("*.nc"))
     return ncs[0] if ncs else None
 
 
 def is_leaf_tile_dir(p: Path, root: Path) -> bool:
-    # Leaf dir heuristic: contains .nc files
+    """
+    Identify leaf tile directories under the root.
+
+    Definition used here:
+    - a directory under --root that contains at least one "*.nc" file
+
+    This is intentionally permissive:
+    - does not hard-require the directory depth to be exactly root/region/londir
+    - but does require the directory to be inside root (via relative_to check)
+    """
     if not p.is_dir():
         return False
     if any(p.glob("*.nc")):
@@ -189,6 +324,21 @@ def is_leaf_tile_dir(p: Path, root: Path) -> bool:
 
 
 def main() -> int:
+    """
+    CLI entrypoint.
+
+    Steps:
+    1) Discover leaf tile directories under --root.
+    2) For each leaf dir:
+         - pick a sample .nc
+         - read bounds from lat/lon coords
+         - build a FeatureCollection (single feature) and write <tile_id>.geojson
+    3) Write combined all_tiles.geojson containing all tile features.
+
+    Overwrite behavior:
+    - Per-tile GeoJSON: written only if it doesn't exist, unless --overwrite is set.
+    - Combined GeoJSON: written if missing, or if --overwrite is set.
+    """
     ap = argparse.ArgumentParser(description="Create GeoJSON polygons for raw leaf dirs.")
     ap.add_argument("--root", type=Path, default=Path("data/raw/era5_land_hourly_temp"),
                     help="Root directory containing region/lonXXX subdirs (default: data/raw/era5_land_hourly_temp)")
@@ -206,6 +356,8 @@ def main() -> int:
         print(f"ERROR: root not found: {root}")
         return 2
 
+
+    # Find all directories under root that contain .nc files.
     leaf_dirs = [p for p in root.rglob("*") if is_leaf_tile_dir(p, root)]
     leaf_dirs.sort()
 
@@ -255,7 +407,7 @@ def main() -> int:
         out_path.write_text(json.dumps({"type": "FeatureCollection", "features": [feat]}, indent=2))
         wrote += 1
 
-    # Combined file
+    # Combined file containing all tile features.
     all_path = out_dir / "all_tiles.geojson"
     if (not all_path.exists()) or args.overwrite:
         all_path.write_text(json.dumps({"type": "FeatureCollection", "features": features}, indent=2))

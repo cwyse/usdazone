@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 """
-Download ERA5-Land hourly 2m temperature into the *new* directory layout:
+download_era5_land_hourly.py
+
+Download ERA5-Land *hourly* 2m temperature (t2m) NetCDF files into the directory layout:
 
     <raw_dir>/
         north/
@@ -19,17 +21,67 @@ Download ERA5-Land hourly 2m temperature into the *new* directory layout:
             lon000/ tropics_lon000_YYYY_MM.nc
             lon180/ tropics_lon180_YYYY_MM.nc
 
-Month rules (same as your pipeline assumptions):
-  - north: DJF  (12, 1, 2)
-  - south: JJA  (6, 7, 8)
-  - tropics: all months
+Purpose
+-------
+- Provide a repeatable, “pipeline-compatible” raw download step for ERA5-Land hourly t2m.
+- Enforce a stable file naming convention and directory hierarchy (new layout only).
+- Split the globe into latitude bands and longitude bins so downloads are smaller and restartable.
+- Validate downloads (basic header checks + xarray open + expected coords/variable).
 
-Lat bands (to avoid overlap with tropics on a 0.1° grid):
-  - north:   (20.1 .. 90]
-  - tropics: [-20 .. 20]
-  - south:   [-90 .. -20.1)
+Region logic (matches your processing assumptions)
+--------------------------------------------------
+Month rules:
+- north:   DJF  (12, 1, 2)  → winter minima in the Northern Hemisphere
+- south:   JJA  (6, 7, 8)   → winter minima in the Southern Hemisphere
+- tropics: all months       → no winter-only shortcut; full year
 
-This script intentionally drops legacy filename support.
+Latitude bands (avoid overlap with tropics on a 0.1° grid)
+- tropics: [-20.0 ..  20.0]
+- north:   ( 20.1 ..  90.0]   i.e. start just above 20.0 to avoid shared row
+- south:   [-90.0 .. -20.1)   i.e. end just below -20.0 to avoid shared row
+
+BAND_EPS = 0.1 is used because ERA5-Land uses a 0.1° grid. If two downloads include
+a boundary latitude/longitude row, they will overlap and you can get off-by-one columns/rows
+or stitching issues later. This script avoids overlap by “nudging” end boundaries.
+
+Longitude bins and why they end at 359.9 / 179.9
+------------------------------------------------
+ERA5 uses 0..360 longitude. CDS “area” bounding boxes are inclusive-ish, and it’s common to
+accidentally request an extra 360.0 or 180.0 column that duplicates 0.0 or causes a mismatch.
+
+To avoid that, longitude bin “east” boundaries end at (bin_end - 0.1), e.g. 90.0 → 89.9.
+
+- Non-tropics: 4 bins of 90° (0–89.9, 90–179.9, 180–269.9, 270–359.9)
+- Tropics:     2 bins of 180° (0–179.9, 180–359.9)
+
+CDS behavior notes
+------------------
+- Although `data_format: netcdf` is requested, CDS sometimes returns a ZIP archive containing
+  the .nc file. This script detects ZIP responses, extracts the single .nc member, and writes
+  it to the final location.
+
+Validation policy
+-----------------
+An existing file is treated as valid and can be skipped if:
+- size >= MIN_EXPECTED_BYTES
+- header looks like NetCDF classic (“CDF…”) or HDF5 (NetCDF4)
+- xarray can open it with netcdf4 engine
+- it contains `t2m` and `latitude`/`longitude` coordinates
+
+CLI usage examples
+------------------
+Plan only (no downloads), show first 12 plan entries:
+  ./download_era5_land_hourly_t2m_new_layout.py --dry-run
+
+Download only tropics for 2019-2020:
+  ./download_era5_land_hourly_t2m_new_layout.py --years 2019-2020 --regions tropics
+
+Overwrite and fail fast on repeated errors:
+  ./download_era5_land_hourly_t2m_new_layout.py --overwrite --strict
+
+Write the computed plan to a JSON file:
+  ./download_era5_land_hourly_t2m_new_layout.py --plan-json plan.json --dry-run
+
 """
 
 from dataclasses import dataclass
@@ -46,15 +98,25 @@ import cdsapi
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+# A conservative “is this plausibly a real ERA5-Land month file?” threshold.
+# If CDS fails and returns HTML/JSON/error payload, it will often be far smaller than this.
 MIN_EXPECTED_BYTES = 5_000_000  # conservative
+
+# Retry policy for CDS calls. CDS outages/throttling happen; this gives a few attempts
+# and then either skips (default) or raises (with --strict).
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 30
 
+# Tropics definition for the pipeline. These constants are used to define latitude bands.
 TROPICS_MIN = -20.0
 TROPICS_MAX = 20.0
+
+# ERA5-Land uses a 0.1° grid. BAND_EPS prevents overlapping boundary rows/cols across downloads.
 BAND_EPS = 0.1  # 0.1° grid: use +/-0.1 to avoid overlap between bands
 
-# Non-tropics: 4 bins of 90 degrees, ENDING AT .9 to avoid inclusive overlap
+# Non-tropics: 4 bins of 90 degrees, ENDING AT (end - 0.1) to avoid inclusive overlap.
+# Example: [0, 90] can include both 0.0 and 90.0 columns; using 89.9 avoids a duplicate
+# boundary column when another file begins at 90.0.
 BINS_NON_TROPICS: list[tuple[float, float, str]] = [
     (0.0,   90.0  - BAND_EPS, "lon000"),
     (90.0,  180.0 - BAND_EPS, "lon090"),
@@ -62,7 +124,7 @@ BINS_NON_TROPICS: list[tuple[float, float, str]] = [
     (270.0, 360.0 - BAND_EPS, "lon270"),
 ]
 
-# Tropics: 2 bins of 180 degrees, ENDING AT .9 to avoid 180.0/360.0 extra column
+# Tropics: 2 bins of 180 degrees, ENDING AT (end - 0.1) to avoid an extra 180.0/360.0 column.
 BINS_TROPICS: list[tuple[float, float, str]] = [
     (0.0,   180.0 - BAND_EPS, "lon000"),
     (180.0, 360.0 - BAND_EPS, "lon180"),
@@ -71,8 +133,12 @@ BINS_TROPICS: list[tuple[float, float, str]] = [
 
 def _looks_like_netcdf(path: Path) -> bool:
     """
-    Quick binary sanity check:
-    NetCDF classic starts with b'CDF'; NetCDF4/HDF5 starts with HDF5 magic.
+    Quick binary sanity check on the file header.
+
+    NetCDF classic format starts with ASCII 'CDF' (e.g., b'CDF\\x01' or b'CDF\\x02').
+    NetCDF4 files are HDF5 containers and begin with the HDF5 magic b'\\x89HDF...'.
+
+    This is not a full validation; it just filters out obvious error payloads.
     """
     try:
         with path.open("rb") as f:
@@ -83,7 +149,18 @@ def _looks_like_netcdf(path: Path) -> bool:
 
 
 def _parse_years(years_arg: str) -> list[int]:
-    """Parse comma-separated list of years or ranges (e.g. "1991-2020,2022")."""
+    """
+    Parse a comma-separated list of years and/or ranges.
+
+    Examples:
+      "1991-2020"         -> [1991, 1992, ..., 2020]
+      "1991-1993,2001"    -> [1991, 1992, 1993, 2001]
+      "2020,2018-2019"    -> [2018, 2019, 2020]
+
+    Notes:
+    - Ranges are inclusive.
+    - If a range is reversed (e.g. "2020-2018"), it is normalized.
+    """
     years: set[int] = set()
     for part in years_arg.split(","):
         part = part.strip()
@@ -101,6 +178,19 @@ def _parse_years(years_arg: str) -> list[int]:
 
 
 def _months_for_region(region: str) -> list[int]:
+    """
+    Define which months to download for each region.
+
+    This is an optimization aligned with your downstream “annual extreme min” pipeline:
+    - In non-tropics, annual minimum temperatures are overwhelmingly determined by winter months.
+      Downloading only winter months reduces storage and CDS load substantially.
+    - In tropics, seasonal variation is weaker and minima can occur in many months, so we download all.
+
+    Regions:
+      north   -> [12, 1, 2]
+      south   -> [6, 7, 8]
+      tropics -> [1..12]
+    """
     if region == "north":
         return [12, 1, 2]
     if region == "south":
@@ -112,7 +202,12 @@ def _months_for_region(region: str) -> list[int]:
 
 def _lat_band_for_region(region: str) -> tuple[float, float]:
     """
-    Returns (north, south) for CDS "area": [N, W, S, E]
+    Return (north, south) latitude values for CDS 'area' bounding boxes.
+
+    CDS uses:
+      area: [N, W, S, E]  (north lat, west lon, south lat, east lon)
+
+    The epsilon adjustments avoid overlapping lat rows between the tropics and non-tropics.
     """
     if region == "north":
         return 90.0, TROPICS_MAX + BAND_EPS  # 90 .. 20.1
@@ -124,16 +219,40 @@ def _lat_band_for_region(region: str) -> tuple[float, float]:
 
 
 def _bins_for_region(region: str) -> list[tuple[int, int, str]]:
+    """
+    Choose longitude bins based on region.
+
+    Tropics uses 2x180° bins to reduce file count. Non-tropics uses 4x90° bins.
+    """
     return BINS_TROPICS if region == "tropics" else BINS_NON_TROPICS
 
 
 def _output_path(raw_dir: Path, region: str, lon_tag: str, year: int, month: int) -> Path:
+    """
+    Compute output path and ensure the output directory exists.
+
+    Output naming convention:
+      <raw_dir>/<region>/<lon_tag>/<region>_<lon_tag>_YYYY_MM.nc
+    """
     out_dir = raw_dir / region / lon_tag
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / f"{region}_{lon_tag}_{year:04d}_{month:02d}.nc"
 
 
 def _is_valid_existing_file(path: Path) -> bool:
+    """
+    Determine whether an existing file should be trusted and skipped.
+
+    Validation steps:
+    1) file exists and meets minimum size
+    2) header looks like NetCDF
+    3) xarray can open it (netcdf4 engine)
+    4) expected elements are present:
+       - variable/data_var `t2m` (ERA5-Land 2m temp)
+       - coords `latitude` and `longitude`
+
+    If any check fails, caller may delete and re-download.
+    """
     if not path.exists():
         return False
     if path.stat().st_size < MIN_EXPECTED_BYTES:
@@ -156,6 +275,22 @@ def _is_valid_existing_file(path: Path) -> bool:
 
 @dataclass(frozen=True)
 class DownloadJob:
+    """
+    One “atomic” download unit: a specific region + lon bin + year + month.
+
+    region:
+      'north' | 'south' | 'tropics'
+
+    lon_west / lon_east:
+      0..360 ERA5 longitudes, with lon_east ending at (bin_end - 0.1)
+      to avoid inclusive overlap.
+
+    lon_tag:
+      Directory tag: lon000 / lon090 / lon180 / lon270 (or lon000 / lon180 for tropics)
+
+    year / month:
+      Year and month to request from CDS.
+    """
     region: str
     lon_west: float
     lon_east: float
@@ -164,15 +299,34 @@ class DownloadJob:
     month: int
 
     def out_path(self, raw_dir: Path) -> Path:
+        """Final NetCDF output path for this job."""
         return _output_path(raw_dir, self.region, self.lon_tag, self.year, self.month)
 
     def area(self) -> list[float]:
+        """
+        Return CDS bounding box as [N, W, S, E].
+
+        N/S come from the region latitude band definition.
+        W/E come from the longitude bin for this job.
+        """
         lat_n, lat_s = _lat_band_for_region(self.region)
         # CDS expects [N, W, S, E]
         return [float(lat_n), float(self.lon_west), float(lat_s), float(self.lon_east)]
 
 
 def build_plan(years: Iterable[int], regions: Iterable[str]) -> list[DownloadJob]:
+    """
+    Build the full list of download jobs implied by the input years and regions.
+
+    For each region:
+      - select region months (DJF/JJA/all)
+      - select region lon bins (4 bins or 2 bins)
+      - cross product: years × months × bins
+
+    Returns:
+      A sorted list of DownloadJob objects (sorted by year, month, region, lon_west)
+      for deterministic logging and execution.
+    """
     plan: list[DownloadJob] = []
     for region in regions:
         months = _months_for_region(region)
@@ -194,6 +348,24 @@ def build_plan(years: Iterable[int], regions: Iterable[str]) -> list[DownloadJob
 
 
 def download_one(job: DownloadJob, raw_dir: Path, overwrite: bool, strict: bool) -> Path:
+    """
+    Execute one CDS download job and write the final NetCDF file.
+
+    Behavior
+    --------
+    - If output exists and overwrite=False:
+        - if it validates, skip it
+        - if it looks invalid, delete and re-download
+    - Downloads to a temporary ".part" file then atomically replaces the final output.
+    - Handles CDS returning ZIP instead of NetCDF by extracting a single .nc member.
+    - Performs deep validation after download (xarray open + t2m + coords).
+    - Retries up to MAX_RETRIES times. After that:
+        - if strict=True: raise an exception (fail fast)
+        - else: log and skip (continue with other jobs)
+
+    Returns:
+      Path to the final output (or the intended path if skipped under non-strict failure mode).
+    """
     out = job.out_path(raw_dir)
 
     if out.exists() and not overwrite:
@@ -205,6 +377,8 @@ def download_one(job: DownloadJob, raw_dir: Path, overwrite: bool, strict: bool)
 
     tmp = out.with_suffix(out.suffix + ".part")
 
+    # CDS request object for ERA5-Land. day/time are requested as complete grids; CDS will
+    # return the available timestamps for that month.
     request = {
         "variable": "2m_temperature",
         "year": f"{job.year}",
@@ -230,6 +404,8 @@ def download_one(job: DownloadJob, raw_dir: Path, overwrite: bool, strict: bool)
                 MAX_RETRIES,
             )
 
+            # cdsapi reads credentials from ~/.cdsapirc and submits the job to CDS.
+            # A new client per attempt is simple and keeps state isolated.
             c = cdsapi.Client()
             c.retrieve("reanalysis-era5-land", request, str(tmp))
 
@@ -240,7 +416,7 @@ def download_one(job: DownloadJob, raw_dir: Path, overwrite: bool, strict: bool)
             if size < MIN_EXPECTED_BYTES:
                 raise RuntimeError(f"Downloaded file too small ({size} bytes)")
 
-            # CDS sometimes returns ZIP even when NetCDF requested
+           # CDS sometimes returns ZIP even when NetCDF requested; handle that case.
             if zipfile.is_zipfile(tmp):
                 log.warning("ZIP response detected from CDS, extracting NetCDF: %s", tmp.name)
 
@@ -271,7 +447,7 @@ def download_one(job: DownloadJob, raw_dir: Path, overwrite: bool, strict: bool)
                     raise RuntimeError("Downloaded file is not NetCDF (bad header)")
                 tmp.replace(out)
 
-            # Deep validation
+            # Deep validation: ensures we downloaded what we think we did.
             if not _is_valid_existing_file(out):
                 raise RuntimeError("Downloaded NetCDF failed validation (missing coords/t2m?)")
 
@@ -306,6 +482,21 @@ def download_one(job: DownloadJob, raw_dir: Path, overwrite: bool, strict: bool)
 
 
 def main() -> int:
+    """
+    CLI entrypoint.
+
+    Steps:
+    1) Parse years and regions.
+    2) Build a deterministic download plan (list of DownloadJob).
+    3) Optionally write plan JSON and/or dry-run.
+    4) Execute downloads, skipping valid existing files unless --overwrite.
+    5) Print totals and elapsed time.
+
+    Exit codes:
+    - 0 on success (including dry-run)
+    - raises SystemExit for invalid CLI arguments
+    - may raise RuntimeError if --strict and a job repeatedly fails
+    """
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--years",
@@ -375,6 +566,7 @@ def main() -> int:
     if len(plan) > args.plan_preview:
         log.info("... %d additional plan entries omitted", len(plan) - args.plan_preview)
 
+    # Optional plan dump for reproducibility / debugging / resuming logic outside this script.
     if args.plan_json:
         payload = [
             {
@@ -400,6 +592,7 @@ def main() -> int:
     wrote = 0
     skipped = 0
 
+    # Main execution: skip files that already validate unless you force overwrite.
     for job in plan:
         out = job.out_path(raw_dir)
         if out.exists() and not args.overwrite and _is_valid_existing_file(out):
