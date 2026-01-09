@@ -115,7 +115,9 @@ def interp_temp_f_point(
     *,
     fallback_nearest: bool = True,
     cyclic_lon: bool = True,
+    assume_lon_normalized_sorted: bool = False,
 ) -> float | None:
+
     """
     Bilinear interpolation (xarray interp) on a 2D lat/lon grid.
 
@@ -136,6 +138,11 @@ def interp_temp_f_point(
     cyclic_lon:
       If True, add a cyclic longitude column to support interpolation across 0/360 seam.
 
+    assume_lon_normalized_sorted:
+      If True, skip longitude coordinate normalization/sorting. Use this when the
+      DataArray has already been normalized to [0,360) and sorted (and optionally
+      made cyclic upstream). This avoids per-call normalization overhead.
+
     Returns
     -------
     float | None:
@@ -148,22 +155,28 @@ def interp_temp_f_point(
     da = ds[var]
 
     # Make longitude convention robust before any seam logic/interp.
-    da = _normalize_lon_coord_to_0_360_sorted(da)
+    # For hot loops, callers may pre-normalize once and set assume_lon_normalized_sorted=True.
+    if not assume_lon_normalized_sorted:
+        da = _normalize_lon_coord_to_0_360_sorted(da)
 
     if cyclic_lon:
         da = add_cyclic_lon_column(da)
 
+
     v = da.interp(latitude=lat, longitude=lon360, method="linear")
-    x = float(v.values)
+    xv = v.values
+    x = float(xv) if np.isscalar(xv) else float(np.asarray(xv).reshape(()))
+
 
     if np.isfinite(x):
         return x
 
     if fallback_nearest:
-        vn = ds[var].sel(latitude=lat, longitude=lon360, method="nearest")
+        vn = da.sel(latitude=lat, longitude=lon360, method="nearest")
         xn = float(vn.values)
         if np.isfinite(xn):
             return xn
+
 
     return None
 

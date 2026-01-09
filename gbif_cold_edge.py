@@ -46,6 +46,18 @@ Thinning (recommended)
 GBIF records can be extremely dense. After pruning, optional grid-thinning (e.g. 25 km)
 keeps at most one record per coarse cell to reduce redundant sampling.
 
+Performance model
+-----------------
+For large batches, GBIF HTTP calls dominate runtime.
+
+This module supports a fast two-stage workflow:
+  1) Fetch GBIF occurrences (parallelizable across species; see species_zone_from_excel.py).
+  2) Sample climate grid (usually done in a single thread with one open dataset).
+
+To enable that, the estimator exposes both:
+  - fetch_gbif_occurrences()                -> List[OccPoint]
+  - estimate_from_occurrences(points, ...)  -> ColdEdgeResult (no GBIF calls)
+
 Outputs
 -------
 The main entrypoint is ColdEdgeEstimator.estimate(), which returns a ColdEdgeResult containing:
@@ -72,28 +84,104 @@ Common reasons for failure / "Unknown":
   - The dataset grid has missing values at those locations (e.g., masked ocean/ice)
   - All sampled points return missing temp_f from USDAZoneDataset.point()
 
+Key bugfixes (rate-limit + resumability)
+----------------------------------------
+- Cross-thread throttle is applied consistently to BOTH GBIF endpoints used:
+    /v1/occurrence/search and /v1/species/match
+- Repeated 429s during paging no longer silently result in an empty occurrence list
+  that looks like "NO_GBIF_POINTS". If rate limiting prevents getting enough points,
+  fetch_gbif_occurrences raises GbifError("GBIF_RATE_LIMIT", ...) so callers can backoff/retry.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, asdict
+import threading
+from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
 import requests
-
 from usda_zone_access import USDAZoneDataset
+
+@dataclass
+class GbifFetchDiagnostics:
+    species: str = ""
+    usage_key: Optional[int] = None
+    used_query_mode: str = ""  # "taxonKey" or "scientificName"
+
+    pages: int = 0
+    gbif_total_reported: Optional[int] = None  # payload.get("count") (GBIF provides this)
+
+    # Filtering counters
+    n_raw_records_seen: int = 0
+    n_missing_coords: int = 0
+    n_uncertainty_filtered: int = 0
+    n_basis_filtered: int = 0
+    n_establishment_filtered: int = 0
+    n_kept: int = 0
+
+    # Failure info (if any)
+    fail_reason: Optional[str] = None
+    fail_detail: Optional[str] = None
+
+class GbifError(RuntimeError):
+    def __init__(self, reason: str, detail: str):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+def make_gbif_session(*, pool_connections: int = 16, pool_maxsize: int = 16) -> requests.Session:
+    """
+    Create a Session with bounded connection pools so threaded runs do not
+    create unbounded sockets.
+    """
+    s = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=int(pool_connections),
+        pool_maxsize=int(pool_maxsize),
+        pool_block=True,
+        max_retries=0,  # we do retries ourselves in _gbif_get
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+    # Default headers for all requests from this session
+    #s.headers.update({
+    #    "Accept": "application/json",
+    #    "Connection": "close",  # helps avoid lingering CLOSE-WAIT on some networks
+    #)
 
 
 GBIF_API = "https://api.gbif.org/v1/occurrence/search"
+# Conservative cross-thread throttle for GBIF calls.
+GBIF_SPECIES_MATCH = "https://api.gbif.org/v1/species/match"
+# Ensures we don't hammer GBIF even if species fetching is parallelized.
+_GBIF_THROTTLE_LOCK = threading.Lock()
+_GBIF_NEXT_ALLOWED_TS = 0.0
+_GBIF_MIN_INTERVAL_S = 0.25  # ~4 requests/sec across all threads (tune 0.25..0.5)
+def _gbif_throttle() -> None:
+    """Best-effort cross-thread global pacing for any GBIF request."""
+    global _GBIF_NEXT_ALLOWED_TS
+    with _GBIF_THROTTLE_LOCK:
+        now = time.time()
+        if now < _GBIF_NEXT_ALLOWED_TS:
+            time.sleep(_GBIF_NEXT_ALLOWED_TS - now)
+        _GBIF_NEXT_ALLOWED_TS = time.time() + float(_GBIF_MIN_INTERVAL_S)
 
-# Conservative defaults. You can broaden later if needed.
-BASIS_OF_RECORD = {"HUMAN_OBSERVATION", "PRESERVED_SPECIMEN"}
+# Plants are frequently OBSERVATION; keep this inclusive.
+BASIS_OF_RECORD = {
+    "HUMAN_OBSERVATION",
+    "OBSERVATION",
+    "PRESERVED_SPECIMEN",
+    "LIVING_SPECIMEN",
+    "MACHINE_OBSERVATION",
+}
 
 # Exclude obvious non-wild points when GBIF provides this field.
-EXCLUDED_ESTABLISHMENT = {"INTRODUCED", "CULTIVATED", "MANAGED", "ESCAPED", "NATURALISED"}
-
+#EXCLUDED_ESTABLISHMENT = {"INTRODUCED", "CULTIVATED", "MANAGED", "ESCAPED", "NATURALISED"}
+EXCLUDED_ESTABLISHMENT = {}
 
 @dataclass(frozen=True)
 class OccPoint:
@@ -164,6 +252,8 @@ class ColdEdgeConfig:
 
     grid_km:
       Grid thinning cell size; larger = faster but less dense sampling.
+    do_thin:
+      Enable thinning.
 
     use_min:
       If True, cold-edge is absolute coldest sampled temp. Otherwise use quantile.
@@ -200,6 +290,8 @@ class ColdEdgeConfig:
     http_timeout_s: int = 60
     http_retries: int = 5
 
+    min_points_for_partial_ok: int = 500   # proceed if we have at least this many cleaned points
+    max_rate_limit_breaks: int = 2         # how many 429s before we give up paging
 
 @dataclass(frozen=True)
 class ColdEdgeResult:
@@ -248,24 +340,158 @@ class ColdEdgeResult:
     drivers: List[Tuple[ClimatePoint, OccPoint]]
 
 
-def _gbif_get(session: requests.Session, params: Dict[str, Any], *, timeout: int, retries: int) -> Dict[str, Any]:
+def _gbif_get(
+    session: requests.Session,
+    params: Dict[str, Any],
+    *,
+    timeout: int,
+    retries: int,
+) -> Dict[str, Any]:
     """
-    Fetch one page from GBIF with basic retry/backoff.
+    Fetch one page from the GBIF occurrence API with retry/backoff.
+
+    - requests.Response is NOT a context manager
+    - response.close() must be called explicitly to avoid FD leaks
+    - handle 429 using Retry-After if present
     """
-    last_err: Optional[Exception] = None
+    # Cross-thread global pacing (best-effort)
+
+    last_reason = None
+    last_detail = None
+
     for attempt in range(1, retries + 1):
+        r: Optional[requests.Response] = None
         try:
-            r = session.get(GBIF_API, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
+            _gbif_throttle()
+            r = session.get(
+                GBIF_API,
+                params=params,
+                timeout=(10, timeout),
+            )
+
+            if r.status_code == 429:
+                ra = (r.headers.get("Retry-After") or "").strip()
+                try:
+                    wait_s = int(ra)
+                    why = f"429 Retry-After={wait_s}"
+                except Exception:
+                    wait_s = min(2 ** attempt, 60)
+                    why = f"429 no Retry-After, backoff={wait_s}"
+                last_reason, last_detail = "GBIF_RATE_LIMIT", f"{why} params={params!r}"
+                time.sleep(max(1, wait_s))
+                continue
+
+            if r.status_code in (500, 502, 503, 504):
+                wait_s = min(2 ** attempt, 20)
+                last_reason, last_detail = "GBIF_SERVER_ERROR", f"status={r.status_code} backoff={wait_s} params={params!r}"
+                time.sleep(wait_s)
+                continue
+
+            if r.status_code != 200:
+                body = (r.text or "")[:200].replace("\n", " ")
+                raise GbifError("GBIF_HTTP_ERROR", f"status={r.status_code} body={body!r} params={params!r}")
+
+            try:
+                return r.json()
+            except Exception as e:
+                raise GbifError("GBIF_DECODE_ERROR", f"{type(e).__name__}: {e} params={params!r}")
+
+        except GbifError:
+            # Non-retryable (except you could choose to retry decode errors)
+            raise
+        except requests.exceptions.Timeout as e:
+            wait_s = min(2 ** attempt, 20)
+            last_reason, last_detail = "GBIF_TIMEOUT", f"{type(e).__name__}: {e} backoff={wait_s} params={params!r}"
+            time.sleep(wait_s)
+        except requests.exceptions.ConnectionError as e:
+            wait_s = min(2 ** attempt, 20)
+            last_reason, last_detail = "GBIF_CONNECTION_ERROR", f"{type(e).__name__}: {e} backoff={wait_s} params={params!r}"
+            time.sleep(wait_s)
         except Exception as e:
-            last_err = e
-            time.sleep(min(2**attempt, 20))
-    assert last_err is not None
-    raise last_err
+            wait_s = min(2 ** attempt, 20)
+            last_reason, last_detail = "GBIF_UNKNOWN_ERROR", f"{type(e).__name__}: {e} backoff={wait_s} params={params!r}"
+            time.sleep(wait_s)
+        finally:
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+
+    raise GbifError(last_reason or "GBIF_FAILED", last_detail or f"exhausted retries params={params!r}")
 
 
-def fetch_gbif_occurrences(scientific_name: str, cfg: ColdEdgeConfig, *, session: Optional[requests.Session] = None) -> List[OccPoint]:
+
+def _gbif_species_match(
+    session: requests.Session,
+    name: str,
+    *,
+    timeout: int,
+    retries: int,
+) -> Optional[int]:
+    """
+    Resolve a scientific name to a GBIF backbone usageKey (taxonKey for occurrence/search).
+    Conservative: requires confidence >= 70.
+    Returns usageKey if match is confident enough, else None.
+    """
+
+    for attempt in range(1, retries + 1):
+        r: Optional[requests.Response] = None
+        try:
+            _gbif_throttle()
+            r = session.get(
+                GBIF_SPECIES_MATCH,
+                params={"name": name},
+                timeout=(10, timeout),
+                headers={"Accept": "application/json"},
+            )
+            if r.status_code == 429:
+                ra = (r.headers.get("Retry-After") or "").strip()
+                try:
+                    wait_s = int(ra)
+                except Exception:
+                    wait_s = min(2 ** attempt, 20)
+                time.sleep(max(1, wait_s))
+                continue
+
+            if r.status_code in (500, 502, 503, 504):
+                time.sleep(min(2 ** attempt, 20))
+                continue
+
+            r.raise_for_status()
+            js = r.json()
+
+            usage_key = js.get("usageKey")
+            confidence = js.get("confidence", 0)
+
+            # Keep this conservative; you can relax later if needed.
+            if usage_key is not None and int(confidence) >= 70:
+                return int(usage_key)
+
+            return None
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            time.sleep(min(2 ** attempt, 20))
+        except Exception:
+            time.sleep(min(2 ** attempt, 20))
+        finally:
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+
+    # If match endpoint fails repeatedly, just fall back to name-based querying.
+    return None
+
+
+def fetch_gbif_occurrences(
+    scientific_name: str,
+    cfg: ColdEdgeConfig,
+    *,
+    session: Optional[requests.Session] = None,
+    diag: Optional[GbifFetchDiagnostics] = None,
+) -> List[OccPoint]:
     """
     Fetch GBIF occurrence points for a scientific name and apply quality filters.
 
@@ -281,79 +507,186 @@ def fetch_gbif_occurrences(scientific_name: str, cfg: ColdEdgeConfig, *, session
 
     Returns:
       A list of OccPoint.
+
+    Notes:
+      - This function does *network I/O* and is therefore parallelizable (threads).
+      - For large batch runs, consider fetching in parallel and then calling
+        estimate_from_occurrences() to do all climate sampling with one open dataset.
+
+    If `diag` is provided, it will be populated with:
+      - query mode (taxonKey vs scientificName), usage_key
+      - paging counts, GBIF-reported total count
+      - filter counters (basis/uncertainty/etc)
+      - fail_reason/fail_detail on GBIF errors
+
+    Important:
+      If repeated 429s prevent collecting enough points (and you don't have cfg.min_points_for_partial_ok),
+      this raises GbifError("GBIF_RATE_LIMIT", ...) rather than returning [] (which would be indistinguishable
+      from "no occurrences").
     """
     own = False
     if session is None:
-        session = requests.Session()
+        session = make_gbif_session()
         own = True
+
+    if diag is not None:
+        diag.species = scientific_name  # harmless if already set
 
     try:
         points: List[OccPoint] = []
         offset = 0
 
+        # Resolve to GBIF backbone usageKey first (synonyms/backbone handling)
+        usage_key = _gbif_species_match(
+            session,
+            scientific_name,
+            timeout=cfg.http_timeout_s,
+            retries=cfg.http_retries,
+        )
+
+        if diag is not None:
+            diag.usage_key = usage_key
+            diag.used_query_mode = "taxonKey" if usage_key is not None else "scientificName"
+
+        rate_limit_breaks = 0
+        last_rate_limit_err: Optional[GbifError] = None
         while offset < cfg.max_records:
             params: Dict[str, Any] = {
-                "scientificName": scientific_name,
                 "hasCoordinate": "true",
                 "occurrenceStatus": "PRESENT",
                 "limit": cfg.page_size,
                 "offset": offset,
+                # requests encodes list values as repeated query params, which GBIF accepts:
+                # basisOfRecord=...&basisOfRecord=...
                 "basisOfRecord": list(BASIS_OF_RECORD),
             }
 
-            payload = _gbif_get(session, params, timeout=cfg.http_timeout_s, retries=cfg.http_retries)
+            if usage_key is not None:
+                params["taxonKey"] = usage_key
+            else:
+                params["scientificName"] = scientific_name
+
+            try:
+                payload = _gbif_get(
+                    session,
+                    params,
+                    timeout=cfg.http_timeout_s,
+                    retries=cfg.http_retries,
+                )
+            except GbifError as e:
+                if getattr(e, "reason", "") == "GBIF_RATE_LIMIT":
+                    rate_limit_breaks += 1
+                    last_rate_limit_err = e
+                    if diag is not None:
+                        diag.fail_reason = e.reason
+                        diag.fail_detail = e.detail
+
+                    # If we already have enough points, stop paging and return what we have.
+                    if len(points) >= cfg.min_points_for_partial_ok:
+                        break
+                    if rate_limit_breaks >= cfg.max_rate_limit_breaks:
+                        raise GbifError(
+                            "GBIF_RATE_LIMIT",
+                            f"rate_limited during paging; breaks={rate_limit_breaks} "
+                            f"points={len(points)} (<{cfg.min_points_for_partial_ok}) last={e.detail}",
+                        )
+
+                    # else: keep trying (the outer loop continues)
+                    continue
+
+                # non-rate-limit: still a hard failure
+                if diag is not None:
+                    diag.fail_reason = getattr(e, "reason", "GBIF_ERROR")
+                    diag.fail_detail = getattr(e, "detail", str(e))
+                raise
+
+            if diag is not None:
+                diag.pages += 1
+                if diag.gbif_total_reported is None:
+                    c = payload.get("count")
+                    if isinstance(c, int):
+                        diag.gbif_total_reported = c
+
             records = payload.get("results", [])
             if not records:
                 break
 
             for rec in records:
+                if diag is not None:
+                    diag.n_raw_records_seen += 1
+
                 lat = rec.get("decimalLatitude")
                 lon = rec.get("decimalLongitude")
                 if lat is None or lon is None:
+                    if diag is not None:
+                        diag.n_missing_coords += 1
                     continue
 
                 cu = rec.get("coordinateUncertaintyInMeters")
-                if cu is not None and cu > cfg.max_uncertainty_m:
+
+                cu_f: Optional[float] = None
+                if cu is not None:
+                    try:
+                        cu_f = float(cu)
+                    except Exception:
+                        cu_f = None  # treat unparsable uncertainty as "missing"
+
+                if cu_f is not None and cu_f > cfg.max_uncertainty_m:
+                    if diag is not None:
+                        diag.n_uncertainty_filtered += 1
                     continue
 
                 bor = rec.get("basisOfRecord")
                 if bor not in BASIS_OF_RECORD:
+                    if diag is not None:
+                        diag.n_basis_filtered += 1
                     continue
 
                 em = rec.get("establishmentMeans")
                 if em and str(em).upper() in EXCLUDED_ESTABLISHMENT:
+                    if diag is not None:
+                        diag.n_establishment_filtered += 1
                     continue
 
                 elev = rec.get("elevation")
                 if elev is None:
                     elev = rec.get("elevationInMeters")
 
-                elev_f: Optional[float]
                 try:
                     elev_f = float(elev) if elev is not None else None
                 except Exception:
                     elev_f = None
 
                 key = rec.get("key")
-                key_i: Optional[int]
                 try:
                     key_i = int(key) if key is not None else None
                 except Exception:
                     key_i = None
 
+                try:
+                    lat_f = float(lat)
+                    lon_f = float(lon)
+                except Exception:
+                    if diag is not None:
+                        diag.n_missing_coords += 1
+                    continue
+
                 points.append(
                     OccPoint(
-                        lat=float(lat),
-                        lon=float(lon),
+                        lat=lat_f,
+                        lon=lon_f,
                         country=rec.get("country"),
                         year=rec.get("year"),
                         basis=str(bor),
                         establishment=em,
-                        uncertainty_m=float(cu) if cu is not None else None,
+                        uncertainty_m=cu_f,
                         elevation_m=elev_f,
                         gbif_key=key_i,
                     )
                 )
+
+                if diag is not None:
+                    diag.n_kept += 1
 
                 if len(points) >= cfg.max_records:
                     break
@@ -365,10 +698,16 @@ def fetch_gbif_occurrences(scientific_name: str, cfg: ColdEdgeConfig, *, session
             time.sleep(cfg.sleep_between_pages_s)
 
         return points
+
     finally:
         if own:
             session.close()
 
+
+
+# --------------------------------------------------------------------
+# Prune / thin
+# --------------------------------------------------------------------
 
 def thin_points_km(points: Sequence[OccPoint], grid_km: float) -> List[OccPoint]:
     """
@@ -468,40 +807,71 @@ def _getattr_any(obj: Any, names: Iterable[str], default: Any = None) -> Any:
             return getattr(obj, n)
     return default
 
+@dataclass
+class ClimateSampleDiagnostics:
+    n_total: int = 0
+    n_ok: int = 0
+    n_temp_missing: int = 0
+    n_temp_nan: int = 0
+    n_exception: int = 0
+    examples_missing: List[Tuple[float, float, str]] = field(default_factory=list)  # (lat, lon, why)
+    examples_limit: int = 20
 
-def sample_climate(zds: USDAZoneDataset, points: Sequence[OccPoint]) -> List[Tuple[ClimatePoint, OccPoint]]:
-    """
-    Sample the climate dataset for each occurrence point.
-
-    Notes:
-      - This delegates all spatial logic to USDAZoneDataset.point() (and by extension
-        usda_zone_core.py).
-      - Points that return missing temp_f are dropped.
-    """
+def sample_climate(
+    zds: USDAZoneDataset,
+    points: Sequence[OccPoint],
+    *,
+    diag: Optional[ClimateSampleDiagnostics] = None,
+) -> List[Tuple[ClimatePoint, OccPoint]]:
     out: List[Tuple[ClimatePoint, OccPoint]] = []
+    if diag is None:
+        diag = ClimateSampleDiagnostics()
+
     for p in points:
-        r = zds.point(p.lat, p.lon)
-        temp_f = _getattr_any(r, ["temp_f"])
-        zone = _getattr_any(r, ["zone_label"], default="—")
-        if temp_f is None:
+        diag.n_total += 1
+        try:
+            r = zds.point(p.lat, p.lon)  # USDAZoneDataset does lon normalization
+
+            temp_f = _getattr_any(r, ["temp_f"])
+            zone = _getattr_any(r, ["zone_label"], default="—")
+
+            if temp_f is None:
+                diag.n_temp_missing += 1
+                if len(diag.examples_missing) < diag.examples_limit:
+                    diag.examples_missing.append((p.lat, p.lon, "temp_f is None"))
+                continue
+
+            # If temp_f is NaN, treat explicitly (common with xarray interpolation)
+            tf = float(temp_f)
+            if math.isnan(tf):
+                diag.n_temp_nan += 1
+                if len(diag.examples_missing) < diag.examples_limit:
+                    diag.examples_missing.append((p.lat, p.lon, "temp_f is NaN"))
+                continue
+
+            diag.n_ok += 1
+            cp = ClimatePoint(
+                lat=p.lat,
+                lon=p.lon,  # report raw GBIF lon
+                temp_f=tf,
+                zone=str(zone),
+                grid_lat=_getattr_any(r, ["grid_lat"], default=None),
+                grid_lon=_getattr_any(r, ["grid_lon"], default=None),
+            )
+            out.append((cp, p))
+
+        except Exception as e:
+            diag.n_exception += 1
+            if len(diag.examples_missing) < diag.examples_limit:
+                diag.examples_missing.append((p.lat, p.lon, f"exception: {type(e).__name__}: {e}"))
             continue
 
-        cp = ClimatePoint(
-            lat=p.lat,
-            lon=p.lon,
-            temp_f=float(temp_f),
-            zone=str(zone),
-            grid_lat=_getattr_any(r, ["grid_lat"], default=None),
-            grid_lon=_getattr_any(r, ["grid_lon"], default=None),
-        )
-        out.append((cp, p))
     return out
 
 
+
 def pick_coldest(sampled: Sequence[Tuple[ClimatePoint, OccPoint]]) -> Tuple[ClimatePoint, OccPoint]:
-    """
-    Return the single coldest sampled point by temp_f.
-    """
+    """Return the single coldest sampled point by temp_f."""
     if not sampled:
         raise ValueError("No sampled points with climate.")
     return min(sampled, key=lambda t: t[0].temp_f)
@@ -546,30 +916,121 @@ def pick_northernmost(points: Sequence[OccPoint]) -> Optional[OccPoint]:
     return max(points, key=lambda p: p.lat)
 
 
+def estimate_from_occurrences(
+    *,
+    species: str,
+    dataset_path: str,
+    cfg: ColdEdgeConfig,
+    occurrences: Sequence[OccPoint],
+    zds: USDAZoneDataset,
+) -> ColdEdgeResult:
+    """
+    Estimate cold-edge for `species` using already-fetched occurrences.
+
+    This performs *no network I/O*.
+
+    Typical use:
+      - Fetch GBIF occurrences for many species in parallel threads.
+      - Open the climate dataset once.
+      - Call this function for each species sequentially.
+    """
+    min_candidates = 25
+
+    pts_pruned = dominance_prune(occurrences, cfg)
+    if len(pts_pruned) < min_candidates and len(occurrences) >= min_candidates:
+        pts_pruned = list(occurrences)  # fall back: no prune
+
+    pts_thin = thin_points_km(pts_pruned, cfg.grid_km) if cfg.do_thin else list(pts_pruned)
+    if len(pts_thin) < min_candidates and len(pts_pruned) >= min_candidates:
+        pts_thin = pts_pruned  # fall back: no thinning
+
+    northmost = pick_northernmost(pts_thin)
+
+    def _try_sample(points: Sequence[OccPoint]) -> tuple[list[tuple[ClimatePoint, OccPoint]], ClimateSampleDiagnostics]:
+        d = ClimateSampleDiagnostics()
+        s = sample_climate(zds, points, diag=d)
+        return s, d
+
+    # stage 1: current candidate set
+    sampled, diag = _try_sample(pts_thin)
+
+    # stage 2: unthinned pruned
+    if not sampled and cfg.do_thin and len(pts_pruned) > len(pts_thin):
+        sampled, diag = _try_sample(pts_pruned)
+    # stage 3: completely unpruned/unthinned
+    if not sampled and len(occurrences) > len(pts_pruned):
+        sampled, diag = _try_sample(list(occurrences))
+
+    if not sampled:
+        raise RuntimeError(
+            f"No climate samples. species={species!r} "
+            f"gbif_cleaned={len(occurrences)} pruned={len(pts_pruned)} thinned={len(pts_thin)} "
+            f"sample_total={diag.n_total} ok={diag.n_ok} "
+            f"missing={diag.n_temp_missing} nan={diag.n_temp_nan} exc={diag.n_exception} "
+            f"examples={diag.examples_missing[:5]!r}"
+        )
+
+
+    coldest_cp, coldest_occ = pick_coldest(sampled)
+
+    if cfg.use_min:
+        edge_cp, edge_occ = coldest_cp, coldest_occ
+        edge_idx = 0
+        method = "min"
+        qval: Optional[float] = None
+    else:
+        edge_cp, edge_occ, edge_idx = pick_cold_edge_quantile(sampled, quantile=cfg.quantile)
+        method = "quantile"
+        qval = float(cfg.quantile)
+
+    sampled_sorted = sorted(sampled, key=lambda t: t[0].temp_f)
+    driver_n = max(1, min(int(cfg.drivers), len(sampled_sorted)))
+    driver_list = sampled_sorted[:driver_n]
+
+    return ColdEdgeResult(
+        species=species,
+        dataset_path=str(dataset_path),
+        config=cfg,
+        n_gbif_points_cleaned=len(occurrences),
+        n_points_after_prune=len(pts_pruned),
+        n_points_after_thinning=len(pts_thin),
+        n_points_with_climate=len(sampled),
+        northernmost_occurrence=northmost,
+        coldest=(coldest_cp, coldest_occ),
+        edge_method=method,
+        quantile=qval,
+        selected_index_in_sorted=int(edge_idx),
+        cold_edge=(edge_cp, edge_occ),
+        drivers=driver_list,
+    )
+
+
 class ColdEdgeEstimator:
     """
     Orchestrates GBIF fetch → prune/thin → climate sample → cold-edge selection.
 
     Usage:
         cfg = ColdEdgeConfig(...)
-        est = ColdEdgeEstimator(dataset_path, cfg)
-        res = est.estimate("Abies koreana")
-        report = result_to_report_dict(res)
+        with ColdEdgeEstimator(dataset_path, cfg) as est:
+            res = est.estimate("Abies koreana")
+            report = result_to_report_dict(res)
 
     Performance notes:
       - The dataset is opened once per estimator and reused for multiple species if you
         keep the estimator alive.
-      - GBIF API calls dominate time for many species; consider caching GBIF responses
-        externally if running huge batches repeatedly.
+      - For large batches, you can fetch GBIF occurrences in parallel and then call
+        estimate_from_occurrences() to avoid opening the dataset in multiple threads.
     """
 
     def __init__(self, dataset_path: str, cfg: Optional[ColdEdgeConfig] = None):
         self.dataset_path = str(dataset_path)
         self.cfg = cfg if cfg is not None else ColdEdgeConfig()
-        self._session = requests.Session()
+        self._session: Optional[requests.Session] = None
         self._zds: Optional[USDAZoneDataset] = None
 
     def __enter__(self) -> "ColdEdgeEstimator":
+        # One session and one open dataset for the lifetime of the context.
+        self._session = make_gbif_session(pool_maxsize=10)
         self._zds = USDAZoneDataset(self.dataset_path)
         self._zds.__enter__()
         return self
@@ -578,74 +1039,33 @@ class ColdEdgeEstimator:
         if self._zds is not None:
             self._zds.__exit__(exc_type, exc, tb)
             self._zds = None
-        self._session.close()
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def fetch_occurrences(self, species: str) -> List[OccPoint]:
+        """Convenience wrapper using the estimator's session."""
+        if self._session is None:
+            raise RuntimeError("ColdEdgeEstimator must be used as a context manager.")
+        return fetch_gbif_occurrences(species, self.cfg, session=self._session)
 
     def estimate(self, species: str) -> ColdEdgeResult:
         """
         End-to-end cold-edge estimation for one species.
 
-        Steps:
-          1) fetch_gbif_occurrences() with filtering
-          2) dominance_prune() (optional; enabled by default)
-          3) thin_points_km() (optional; enabled by default)
-          4) sample climate via USDAZoneDataset.point()
-          5) pick coldest point and either:
-               - cfg.use_min=True: cold_edge = coldest
-               - else: cold_edge = quantile point (default 5th percentile)
-          6) compute driver list = N coldest sampled points
-
         Raises:
           RuntimeError if no climate samples overlap the grid (or all missing temp_f).
         """
-        if self._zds is None:
-            raise RuntimeError("ColdEdgeEstimator must be used as a context manager: with ColdEdgeEstimator(...) as est:")
+        if self._session is None or self._zds is None:
+            raise RuntimeError("ColdEdgeEstimator must be used as a context manager.")
 
-        cfg = self.cfg
-
-        pts = fetch_gbif_occurrences(species, cfg, session=self._session)
-        pts_pruned = dominance_prune(pts, cfg)
-        if cfg.do_thin:
-            pts_thin = thin_points_km(pts_pruned, grid_km=cfg.grid_km)
-        else:
-            pts_thin = list(pts_pruned)
-
-        northmost = pick_northernmost(pts_thin)
-
-        sampled = sample_climate(self._zds, pts_thin)
-        if not sampled:
-            raise RuntimeError("No GBIF points overlapped the climate grid (or all returned missing temp_f).")
-
-        coldest_cp, coldest_occ = pick_coldest(sampled)
-
-        if cfg.use_min:
-            edge_cp, edge_occ = coldest_cp, coldest_occ
-            edge_idx = 0
-            method = "min"
-            qval: Optional[float] = None
-        else:
-            edge_cp, edge_occ, edge_idx = pick_cold_edge_quantile(sampled, quantile=cfg.quantile)
-            method = "quantile"
-            qval = float(cfg.quantile)
-
-        sampled_sorted = sorted(sampled, key=lambda t: t[0].temp_f)
-        driver_n = max(1, min(int(cfg.drivers), len(sampled_sorted)))
-        driver_list = sampled_sorted[:driver_n]
-
-        return ColdEdgeResult(
+        occ = fetch_gbif_occurrences(species, self.cfg, session=self._session)
+        return estimate_from_occurrences(
             species=species,
             dataset_path=self.dataset_path,
-            config=cfg,
-            n_gbif_points_cleaned=len(pts),
-            n_points_after_prune=len(pts_pruned),
-            n_points_after_thinning=len(pts_thin),
-            n_points_with_climate=len(sampled),
-            northernmost_occurrence=northmost,
-            coldest=(coldest_cp, coldest_occ),
-            edge_method=method,
-            quantile=qval,
-            selected_index_in_sorted=int(edge_idx),
-            cold_edge=(edge_cp, edge_occ),
-            drivers=driver_list,
+            cfg=self.cfg,
+            occurrences=occ,
+            zds=self._zds,
         )
 
 

@@ -55,25 +55,40 @@ Notes
 from pathlib import Path
 import xarray as xr
 
-from usda_zone_core import interp_temp_f_point, zone_point_from_temp_f, ZonePoint
-
+from usda_zone_core import (
+    interp_temp_f_point,
+    zone_point_from_temp_f,
+    ZonePoint,
+    _normalize_lon_coord_to_0_360_sorted,
+    add_cyclic_lon_column,
+)
 
 class USDAZoneDataset:
-    """
-    Context-managed reader for a merged global USDA-zone-temperature climatology dataset.
-    """
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
         self.ds: xr.Dataset | None = None
+        self._da_temp_f: xr.DataArray | None = None
+        self._ds_view: xr.Dataset | None = None
 
     def __enter__(self) -> "USDAZoneDataset":
         self.ds = xr.open_dataset(self.path)
+
+        # Normalize/cyclic once for performance and seam correctness
+        self._da_temp_f = _normalize_lon_coord_to_0_360_sorted(self.ds["usda_zone_temp_f"])
+        self._da_temp_f = add_cyclic_lon_column(self._da_temp_f)
+
+        # Cache a minimal dataset view so point() doesn't allocate a new xr.Dataset each call
+        self._ds_view = xr.Dataset({"usda_zone_temp_f": self._da_temp_f})
         return self
+
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self.ds is not None:
             self.ds.close()
             self.ds = None
+        self._da_temp_f = None
+        self._ds_view = None
+
 
     def point(self, lat: float, lon: float) -> ZonePoint:
         """
@@ -95,6 +110,19 @@ class USDAZoneDataset:
           Output of zone_point_from_temp_f(temp_f). If sampling returns missing,
           ZonePoint should represent missing accordingly (per your core logic).
         """
-        assert self.ds is not None
-        temp_f = interp_temp_f_point(self.ds, lat, lon, var="usda_zone_temp_f")
+        assert self._ds_view is not None  # __enter__ must have been called
+
+        # Use the core routine so lon normalization + seam behavior stays centralized.
+        temp_f = interp_temp_f_point(
+            self._ds_view,
+            lat=float(lat),
+            lon=float(lon),
+            var="usda_zone_temp_f",
+            fallback_nearest=True,
+            cyclic_lon=False,  # already cyclic
+            assume_lon_normalized_sorted=True,
+        )
+
+
         return zone_point_from_temp_f(temp_f)
+

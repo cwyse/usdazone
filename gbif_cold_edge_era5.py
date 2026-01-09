@@ -46,7 +46,9 @@ from gbif_cold_edge import ColdEdgeConfig, ColdEdgeEstimator, result_to_report_d
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Estimate species cold-edge hardiness zone using GBIF + ERA5-derived climatology.")
+    p = argparse.ArgumentParser(
+        description="Estimate species cold-edge hardiness zone using GBIF + ERA5-derived climatology."
+    )
     p.add_argument("--species", required=True, help='Scientific name (e.g., "Abies koreana").')
     p.add_argument("--dataset", required=True, help="Path to global_usda_zone_temperature_1991_2020.nc (or equivalent).")
 
